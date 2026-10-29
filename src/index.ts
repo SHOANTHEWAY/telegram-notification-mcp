@@ -7,6 +7,8 @@ import { sendTelegramMessage } from "./telegram";
 
 const MCP_ENDPOINT_PATH = "/mcp";
 const LEGACY_SSE_ENDPOINT_PATH = "/sse";
+const SECRET_PATH_PREFIX = `${MCP_ENDPOINT_PATH}/`;
+const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 
 function createTelegramMcpServer(environment: Env): McpServer {
 	const server = new McpServer({
@@ -17,17 +19,18 @@ function createTelegramMcpServer(environment: Env): McpServer {
 	server.registerTool(
 		"send_telegram_message",
 		{
-			description: "Send a notification through the configured Telegram bot.",
+			description:
+				"Send a notification to the configured family Telegram group. The destination is fixed server-side.",
 			inputSchema: {
-				text: z.string().min(1),
-				chat_id: z.union([z.number(), z.string()]).optional(),
+				text: z.string().min(1).max(TELEGRAM_MAX_MESSAGE_LENGTH),
 				parse_mode: z.enum(["Markdown", "HTML"]).optional(),
 				disable_notification: z.boolean().optional(),
 			},
 		},
-		async ({ text, chat_id, parse_mode, disable_notification }) => {
+		async ({ text, parse_mode, disable_notification }) => {
 			const botToken = environment.BOT_TOKEN;
-			const targetChatId = chat_id ?? environment.DEFAULT_CHAT_ID;
+			// Locked: callers cannot choose the destination chat.
+			const targetChatId = environment.DEFAULT_CHAT_ID;
 
 			if (!botToken) {
 				return {
@@ -41,7 +44,7 @@ function createTelegramMcpServer(environment: Env): McpServer {
 					content: [
 						{
 							type: "text",
-							text: "No chat_id was provided and DEFAULT_CHAT_ID is not configured",
+							text: "DEFAULT_CHAT_ID is not configured",
 						},
 					],
 					isError: true,
@@ -166,7 +169,12 @@ export default {
 			);
 		}
 
-		if (url.pathname !== MCP_ENDPOINT_PATH) {
+		const isBaseEndpoint = url.pathname === MCP_ENDPOINT_PATH;
+		const isSecretPathEndpoint =
+			url.pathname.startsWith(SECRET_PATH_PREFIX) &&
+			url.pathname.length > SECRET_PATH_PREFIX.length;
+
+		if (!isBaseEndpoint && !isSecretPathEndpoint) {
 			return new Response("Not found", { status: 404 });
 		}
 
@@ -174,7 +182,24 @@ export default {
 			return new Response("MCP_AUTH_TOKEN is not configured", { status: 503 });
 		}
 
-		if (
+		if (isSecretPathEndpoint) {
+			// For clients that cannot send headers (e.g. claude.ai custom connectors):
+			// the token is the final path segment. Wrong token => 404, revealing nothing.
+			const providedPathToken = decodeURIComponent(
+				url.pathname.slice(SECRET_PATH_PREFIX.length),
+			);
+			if (
+				!(await authenticationTokensMatch(
+					providedPathToken,
+					environment.MCP_AUTH_TOKEN,
+				))
+			) {
+				return new Response("Not found", { status: 404 });
+			}
+			// Hand the MCP SDK a request on the canonical route.
+			url.pathname = MCP_ENDPOINT_PATH;
+			request = new Request(url.toString(), request);
+		} else if (
 			request.method !== "OPTIONS" &&
 			!(await requestIsAuthorized(request, environment.MCP_AUTH_TOKEN))
 		) {
